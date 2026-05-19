@@ -1,0 +1,164 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ecommerce_ml}
+      POSTGRES_USER: ${POSTGRES_USER:-ml_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ml_password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ml_user} -d ${POSTGRES_DB:-ecommerce_ml}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  kafka:
+    image: bitnami/kafka:3.7
+    environment:
+      KAFKA_CFG_NODE_ID: 1
+      KAFKA_CFG_PROCESS_ROLES: broker,controller
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+
+  producer:
+    build:
+      context: .
+      dockerfile: producer/Dockerfile
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-ecommerce-transactions}
+      SOURCE_CSV: /app/data/raw/ecommerce_sample.csv
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+    command: ["python", "-m", "producer.producer"]
+
+  lake-writer:
+    build:
+      context: .
+      dockerfile: producer/Dockerfile
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-ecommerce-transactions}
+      RAW_LAKE_DIR: /app/data/raw/kafka_ingested
+      HDFS_NAMENODE_WEBHDFS_URL: ${HDFS_NAMENODE_WEBHDFS_URL:-}
+      HDFS_RAW_DIR: ${HDFS_RAW_DIR:-/data/ecommerce/raw}
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+    command: ["python", "-m", "producer.lake_writer"]
+
+  processor:
+    build:
+      context: .
+      dockerfile: processor/Dockerfile
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ecommerce_ml}
+      POSTGRES_USER: ${POSTGRES_USER:-ml_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ml_password}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      RAW_LAKE_DIR: /app/data/raw/kafka_ingested
+      PROCESSED_DIR: /app/data/processed
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+    command: ["python", "-m", "processor.batch_job"]
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ecommerce_ml}
+      POSTGRES_USER: ${POSTGRES_USER:-ml_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ml_password}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    profiles: ["full"]
+    environment:
+      CLUSTER_NAME: ecommerce-batch-cluster
+      CORE_CONF_fs_defaultFS: hdfs://namenode:9000
+    ports:
+      - "9870:9870"
+      - "9000:9000"
+    volumes:
+      - hadoop-namenode:/hadoop/dfs/name
+
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    profiles: ["full"]
+    environment:
+      CORE_CONF_fs_defaultFS: hdfs://namenode:9000
+      SERVICE_PRECONDITION: namenode:9870
+    depends_on:
+      - namenode
+    volumes:
+      - hadoop-datanode:/hadoop/dfs/data
+
+  spark:
+    image: bitnami/spark:3.5
+    profiles: ["full"]
+    environment:
+      SPARK_MODE: master
+    ports:
+      - "7077:7077"
+      - "8081:8080"
+    volumes:
+      - ./processor:/app/processor
+      - ./data:/app/data
+
+  airflow:
+    image: apache/airflow:2.9.3-python3.11
+    profiles: ["full"]
+    environment:
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////opt/airflow/airflow.db
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW_ADMIN_USERNAME: airflow
+      AIRFLOW_ADMIN_PASSWORD: airflow
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./data:/opt/airflow/data
+      - ./scripts:/opt/airflow/scripts
+    command: >
+      bash -c "airflow db migrate &&
+      airflow users create --username airflow --password airflow --firstname Data --lastname Admin --role Admin --email airflow@example.com || true &&
+      airflow standalone"
+
+volumes:
+  postgres-data:
+  hadoop-namenode:
+  hadoop-datanode:
